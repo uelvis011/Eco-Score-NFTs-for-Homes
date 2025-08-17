@@ -14,6 +14,13 @@
 (define-constant err-invalid-score (err u108))
 (define-constant err-invalid-upgrade (err u109))
 (define-constant err-insufficient-credits (err u110))
+(define-constant err-achievement-claimed (err u111))
+(define-constant err-score-not-reached (err u112))
+
+(define-constant achievement-eco-warrior u100)
+(define-constant achievement-green-champion u150)
+(define-constant achievement-sustainability-expert u200)
+(define-constant achievement-eco-master u250)
 
 (define-data-var last-token-id uint u0)
 (define-data-var total-eco-credits uint u0)
@@ -47,6 +54,8 @@
 
 (define-map market-listings uint {price: uint, seller: principal})
 
+(define-map claimed-achievements {user: principal, level: uint} {claimed-at: uint, bonus-credits: uint})
+
 (define-read-only (get-last-token-id)
   (var-get last-token-id))
 
@@ -73,6 +82,27 @@
 
 (define-read-only (get-market-listing (token-id uint))
   (map-get? market-listings token-id))
+
+(define-read-only (has-achievement (user principal) (level uint))
+  (is-some (map-get? claimed-achievements {user: user, level: level})))
+
+(define-read-only (get-achievement-info (user principal) (level uint))
+  (map-get? claimed-achievements {user: user, level: level}))
+
+(define-read-only (check-achievement-eligibility (token-id uint))
+  (let 
+    (
+      (score-data (unwrap! (get-eco-score token-id) err-token-not-found))
+      (total-score (get total-score score-data))
+      (owner (unwrap! (nft-get-owner? eco-home token-id) err-token-not-found))
+    )
+    (ok {
+      eco-warrior: (and (>= total-score achievement-eco-warrior) (not (has-achievement owner achievement-eco-warrior))),
+      green-champion: (and (>= total-score achievement-green-champion) (not (has-achievement owner achievement-green-champion))),
+      sustainability-expert: (and (>= total-score achievement-sustainability-expert) (not (has-achievement owner achievement-sustainability-expert))),
+      eco-master: (and (>= total-score achievement-eco-master) (not (has-achievement owner achievement-eco-master))),
+      total-score: total-score
+    })))
 
 (define-read-only (calculate-base-score (insulation uint) (solar bool) (rainwater bool) (energy uint) (waste uint))
   (let 
@@ -257,3 +287,25 @@
       upgrade-score: (get upgrade-score scores),
       total-score: (get total-score scores)
     })))
+
+(define-private (get-achievement-reward (level uint))
+  (if (is-eq level achievement-eco-warrior) u50
+    (if (is-eq level achievement-green-champion) u100
+      (if (is-eq level achievement-sustainability-expert) u200
+        (if (is-eq level achievement-eco-master) u500 u0)))))
+
+(define-public (claim-achievement (token-id uint) (achievement-level uint))
+  (let 
+    (
+      (owner (unwrap! (nft-get-owner? eco-home token-id) err-token-not-found))
+      (score-data (unwrap! (get-eco-score token-id) err-token-not-found))
+      (total-score (get total-score score-data))
+      (reward-amount (get-achievement-reward achievement-level))
+    )
+    (asserts! (is-eq tx-sender owner) err-not-token-owner)
+    (asserts! (not (has-achievement owner achievement-level)) err-achievement-claimed)
+    (asserts! (>= total-score achievement-level) err-score-not-reached)
+    (asserts! (> reward-amount u0) err-invalid-score)
+    (map-set claimed-achievements {user: owner, level: achievement-level} {claimed-at: stacks-block-height, bonus-credits: reward-amount})
+    (try! (award-eco-credits owner reward-amount))
+    (ok achievement-level)))
