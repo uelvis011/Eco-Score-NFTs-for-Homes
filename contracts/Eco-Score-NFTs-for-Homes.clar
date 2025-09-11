@@ -16,14 +16,26 @@
 (define-constant err-insufficient-credits (err u110))
 (define-constant err-achievement-claimed (err u111))
 (define-constant err-score-not-reached (err u112))
+(define-constant err-maintenance-too-soon (err u113))
+(define-constant err-invalid-maintenance-type (err u114))
 
 (define-constant achievement-eco-warrior u100)
 (define-constant achievement-green-champion u150)
 (define-constant achievement-sustainability-expert u200)
 (define-constant achievement-eco-master u250)
 
+(define-constant blocks-per-month u4380)
+(define-constant blocks-per-year u52560)
+(define-constant decay-rate-per-month u2)
+(define-constant maintenance-cooldown-blocks u1095)
+
 (define-data-var last-token-id uint u0)
 (define-data-var total-eco-credits uint u0)
+
+(map-set maintenance-types "solar-cleaning" {score-boost: u5, credit-reward: u10})
+(map-set maintenance-types "insulation-check" {score-boost: u3, credit-reward: u8})
+(map-set maintenance-types "energy-audit" {score-boost: u8, credit-reward: u15})
+(map-set maintenance-types "system-upgrade" {score-boost: u12, credit-reward: u25})
 
 (define-map token-eco-scores uint 
   {
@@ -55,6 +67,19 @@
 (define-map market-listings uint {price: uint, seller: principal})
 
 (define-map claimed-achievements {user: principal, level: uint} {claimed-at: uint, bonus-credits: uint})
+
+(define-map maintenance-records uint 
+  {
+    last-maintenance: uint,
+    maintenance-count: uint,
+    last-decay-calculation: uint
+  })
+
+(define-map maintenance-types (string-ascii 30)
+  {
+    score-boost: uint,
+    credit-reward: uint
+  })
 
 (define-read-only (get-last-token-id)
   (var-get last-token-id))
@@ -88,6 +113,35 @@
 
 (define-read-only (get-achievement-info (user principal) (level uint))
   (map-get? claimed-achievements {user: user, level: level}))
+
+(define-read-only (get-maintenance-record (token-id uint))
+  (map-get? maintenance-records token-id))
+
+(define-read-only (get-maintenance-type-info (maintenance-type (string-ascii 30)))
+  (map-get? maintenance-types maintenance-type))
+
+(define-read-only (calculate-score-decay (token-id uint))
+  (let 
+    (
+      (maintenance-record (default-to {last-maintenance: u0, maintenance-count: u0, last-decay-calculation: u0} (map-get? maintenance-records token-id)))
+      (last-decay (get last-decay-calculation maintenance-record))
+      (last-update (if (> last-decay u0) last-decay stacks-block-height))
+      (blocks-passed (- stacks-block-height last-update))
+      (months-passed (/ blocks-passed blocks-per-month))
+      (decay-amount (* months-passed decay-rate-per-month))
+    )
+    (ok {blocks-passed: blocks-passed, months-passed: months-passed, decay-amount: decay-amount})))
+
+(define-read-only (get-current-effective-score (token-id uint))
+  (let 
+    (
+      (score-data (unwrap! (get-eco-score token-id) err-token-not-found))
+      (decay-info (unwrap! (calculate-score-decay token-id) err-token-not-found))
+      (raw-total (get total-score score-data))
+      (decay-amount (get decay-amount decay-info))
+      (effective-score (if (> raw-total decay-amount) (- raw-total decay-amount) u0))
+    )
+    (ok {raw-score: raw-total, decay-amount: decay-amount, effective-score: effective-score})))
 
 (define-read-only (check-achievement-eligibility (token-id uint))
   (let 
@@ -152,6 +206,7 @@
         waste-management: waste-management
       })
     (var-set last-token-id token-id)
+    (map-set maintenance-records token-id {last-maintenance: stacks-block-height, maintenance-count: u0, last-decay-calculation: stacks-block-height})
     (ok token-id)))
 
 (define-public (add-inspector (inspector principal))
@@ -293,6 +348,57 @@
     (if (is-eq level achievement-green-champion) u100
       (if (is-eq level achievement-sustainability-expert) u200
         (if (is-eq level achievement-eco-master) u500 u0)))))
+
+(define-public (perform-maintenance (token-id uint) (maintenance-type (string-ascii 30)))
+  (let 
+    (
+      (owner (unwrap! (nft-get-owner? eco-home token-id) err-token-not-found))
+      (maintenance-info (unwrap! (get-maintenance-type-info maintenance-type) err-invalid-maintenance-type))
+      (maintenance-record (default-to {last-maintenance: u0, maintenance-count: u0, last-decay-calculation: u0} (get-maintenance-record token-id)))
+      (score-data (unwrap! (get-eco-score token-id) err-token-not-found))
+      (score-boost (get score-boost maintenance-info))
+      (credit-reward (get credit-reward maintenance-info))
+      (last-maintenance (get last-maintenance maintenance-record))
+    )
+    (asserts! (is-eq tx-sender owner) err-not-token-owner)
+    (asserts! (>= (- stacks-block-height last-maintenance) maintenance-cooldown-blocks) err-maintenance-too-soon)
+    (map-set token-eco-scores token-id 
+      (merge score-data 
+        {
+          upgrade-score: (+ (get upgrade-score score-data) score-boost),
+          total-score: (+ (get total-score score-data) score-boost),
+          last-updated: stacks-block-height
+        }))
+    (map-set maintenance-records token-id
+      {
+        last-maintenance: stacks-block-height,
+        maintenance-count: (+ (get maintenance-count maintenance-record) u1),
+        last-decay-calculation: stacks-block-height
+      })
+    (map-set eco-credits-balance owner (+ (get-eco-credits owner) credit-reward))
+    (var-set total-eco-credits (+ (var-get total-eco-credits) credit-reward))
+    (ok {score-boost: score-boost, credit-reward: credit-reward})))
+
+(define-public (apply-score-decay (token-id uint))
+  (let 
+    (
+      (score-data (unwrap! (get-eco-score token-id) err-token-not-found))
+      (decay-info (unwrap! (calculate-score-decay token-id) err-token-not-found))
+      (decay-amount (get decay-amount decay-info))
+      (maintenance-record (default-to {last-maintenance: u0, maintenance-count: u0, last-decay-calculation: u0} (get-maintenance-record token-id)))
+      (current-total (get total-score score-data))
+      (new-total (if (> current-total decay-amount) (- current-total decay-amount) u0))
+    )
+    (asserts! (> decay-amount u0) err-invalid-score)
+    (map-set token-eco-scores token-id 
+      (merge score-data 
+        {
+          total-score: new-total,
+          last-updated: stacks-block-height
+        }))
+    (map-set maintenance-records token-id
+      (merge maintenance-record {last-decay-calculation: stacks-block-height}))
+    (ok {decay-applied: decay-amount, new-score: new-total})))
 
 (define-public (claim-achievement (token-id uint) (achievement-level uint))
   (let 
