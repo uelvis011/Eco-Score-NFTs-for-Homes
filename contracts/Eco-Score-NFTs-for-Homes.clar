@@ -18,6 +18,9 @@
 (define-constant err-score-not-reached (err u112))
 (define-constant err-maintenance-too-soon (err u113))
 (define-constant err-invalid-maintenance-type (err u114))
+(define-constant err-invalid-carbon-data (err u115))
+(define-constant err-carbon-tracking-disabled (err u116))
+(define-constant err-report-too-soon (err u117))
 
 (define-constant achievement-eco-warrior u100)
 (define-constant achievement-green-champion u150)
@@ -28,6 +31,8 @@
 (define-constant blocks-per-year u52560)
 (define-constant decay-rate-per-month u2)
 (define-constant maintenance-cooldown-blocks u1095)
+(define-constant carbon-report-cooldown u2190) ;; ~30 days between reports
+(define-constant carbon-reduction-threshold u10) ;; 10% reduction for bonus
 
 (define-data-var last-token-id uint u0)
 (define-data-var total-eco-credits uint u0)
@@ -81,6 +86,28 @@
     credit-reward: uint
   })
 
+;; Carbon footprint tracking maps
+(define-map carbon-footprint-data uint
+  {
+    monthly-kwh-usage: uint,
+    monthly-gas-usage: uint,
+    monthly-water-usage: uint,
+    monthly-waste-produced: uint,
+    calculated-co2-tons: uint,
+    last-report-block: uint,
+    tracking-enabled: bool,
+    baseline-co2: uint,
+    total-reports: uint
+  })
+
+(define-map carbon-reduction-achievements {token-id: uint, period: uint}
+  {
+    reduction-percentage: uint,
+    co2-saved: uint,
+    bonus-credits: uint,
+    achieved-at: uint
+  })
+
 (define-read-only (get-last-token-id)
   (var-get last-token-id))
 
@@ -119,6 +146,36 @@
 
 (define-read-only (get-maintenance-type-info (maintenance-type (string-ascii 30)))
   (map-get? maintenance-types maintenance-type))
+
+;; Carbon footprint read-only functions
+(define-read-only (get-carbon-footprint-data (token-id uint))
+  (map-get? carbon-footprint-data token-id))
+
+(define-read-only (get-carbon-reduction-achievement (token-id uint) (period uint))
+  (map-get? carbon-reduction-achievements {token-id: token-id, period: period}))
+
+(define-read-only (calculate-co2-emissions (kwh-usage uint) (gas-usage uint) (water-usage uint) (waste-kg uint))
+  (let
+    (
+      ;; CO2 factors (simplified): kWh * 0.4kg, gas * 2kg, water * 0.3kg, waste * 0.5kg
+      (electricity-co2 (/ (* kwh-usage u4) u10)) ;; 0.4kg per kWh
+      (gas-co2 (* gas-usage u2)) ;; 2kg per unit
+      (water-co2 (/ (* water-usage u3) u10)) ;; 0.3kg per unit
+      (waste-co2 (/ (* waste-kg u5) u10)) ;; 0.5kg per kg
+      (total-kg (+ electricity-co2 (+ gas-co2 (+ water-co2 waste-co2))))
+    )
+    (ok (/ total-kg u1000)))) ;; Convert to tons
+
+(define-read-only (get-carbon-reduction-percentage (token-id uint))
+  (let
+    (
+      (carbon-data (unwrap! (get-carbon-footprint-data token-id) err-carbon-tracking-disabled))
+      (current-co2 (get calculated-co2-tons carbon-data))
+      (baseline-co2 (get baseline-co2 carbon-data))
+    )
+    (if (and (> baseline-co2 u0) (< current-co2 baseline-co2))
+      (ok (/ (* (- baseline-co2 current-co2) u100) baseline-co2))
+      (ok u0))))
 
 (define-read-only (calculate-score-decay (token-id uint))
   (let 
@@ -207,6 +264,19 @@
       })
     (var-set last-token-id token-id)
     (map-set maintenance-records token-id {last-maintenance: stacks-block-height, maintenance-count: u0, last-decay-calculation: stacks-block-height})
+    ;; Initialize carbon footprint tracking (disabled by default)
+    (map-set carbon-footprint-data token-id
+      {
+        monthly-kwh-usage: u0,
+        monthly-gas-usage: u0,
+        monthly-water-usage: u0,
+        monthly-waste-produced: u0,
+        calculated-co2-tons: u0,
+        last-report-block: stacks-block-height,
+        tracking-enabled: false,
+        baseline-co2: u0,
+        total-reports: u0
+      })
     (ok token-id)))
 
 (define-public (add-inspector (inspector principal))
@@ -415,3 +485,85 @@
     (map-set claimed-achievements {user: owner, level: achievement-level} {claimed-at: stacks-block-height, bonus-credits: reward-amount})
     (try! (award-eco-credits owner reward-amount))
     (ok achievement-level)))
+
+;; Carbon footprint tracking functions
+(define-public (enable-carbon-tracking (token-id uint))
+  (let
+    (
+      (owner (unwrap! (nft-get-owner? eco-home token-id) err-token-not-found))
+      (carbon-data (unwrap! (get-carbon-footprint-data token-id) err-token-not-found))
+    )
+    (asserts! (is-eq tx-sender owner) err-not-token-owner)
+    (map-set carbon-footprint-data token-id (merge carbon-data {tracking-enabled: true}))
+    (ok true)))
+
+(define-public (report-monthly-usage
+  (token-id uint)
+  (kwh-usage uint)
+  (gas-usage uint)
+  (water-usage uint)
+  (waste-kg uint))
+  (let
+    (
+      (owner (unwrap! (nft-get-owner? eco-home token-id) err-token-not-found))
+      (carbon-data (unwrap! (get-carbon-footprint-data token-id) err-token-not-found))
+      (calculated-co2 (unwrap! (calculate-co2-emissions kwh-usage gas-usage water-usage waste-kg) err-invalid-carbon-data))
+      (last-report (get last-report-block carbon-data))
+      (reports-count (get total-reports carbon-data))
+      (current-baseline (get baseline-co2 carbon-data))
+    )
+    (asserts! (is-eq tx-sender owner) err-not-token-owner)
+    (asserts! (get tracking-enabled carbon-data) err-carbon-tracking-disabled)
+    (asserts! (>= (- stacks-block-height last-report) carbon-report-cooldown) err-report-too-soon)
+    (asserts! (and (> kwh-usage u0) (> calculated-co2 u0)) err-invalid-carbon-data)
+    
+    ;; Set baseline on first report
+    (let
+      (
+        (new-baseline (if (is-eq reports-count u0) calculated-co2 current-baseline))
+      )
+      (map-set carbon-footprint-data token-id
+        {
+          monthly-kwh-usage: kwh-usage,
+          monthly-gas-usage: gas-usage,
+          monthly-water-usage: water-usage,
+          monthly-waste-produced: waste-kg,
+          calculated-co2-tons: calculated-co2,
+          last-report-block: stacks-block-height,
+          tracking-enabled: true,
+          baseline-co2: new-baseline,
+          total-reports: (+ reports-count u1)
+        })
+      ;; Award eco credits for tracking (small bonus)
+      (try! (award-eco-credits owner u5))
+      (ok {co2-calculated: calculated-co2, baseline-set: new-baseline}))))
+
+(define-public (claim-carbon-reduction-achievement (token-id uint))
+  (let
+    (
+      (owner (unwrap! (nft-get-owner? eco-home token-id) err-token-not-found))
+      (carbon-data (unwrap! (get-carbon-footprint-data token-id) err-token-not-found))
+      (reduction-pct (unwrap! (get-carbon-reduction-percentage token-id) err-carbon-tracking-disabled))
+      (reports-count (get total-reports carbon-data))
+      (period reports-count)
+      (existing-achievement (get-carbon-reduction-achievement token-id period))
+      (co2-saved (if (> (get baseline-co2 carbon-data) u0) 
+                   (- (get baseline-co2 carbon-data) (get calculated-co2-tons carbon-data))
+                   u0))
+      (bonus-credits (* reduction-pct u2)) ;; 2 credits per % reduction
+    )
+    (asserts! (is-eq tx-sender owner) err-not-token-owner)
+    (asserts! (get tracking-enabled carbon-data) err-carbon-tracking-disabled)
+    (asserts! (>= reduction-pct carbon-reduction-threshold) err-score-not-reached)
+    (asserts! (> reports-count u1) err-invalid-carbon-data) ;; Need at least 2 reports
+    (asserts! (is-none existing-achievement) err-achievement-claimed)
+    
+    (map-set carbon-reduction-achievements {token-id: token-id, period: period}
+      {
+        reduction-percentage: reduction-pct,
+        co2-saved: co2-saved,
+        bonus-credits: bonus-credits,
+        achieved-at: stacks-block-height
+      })
+    (try! (award-eco-credits owner bonus-credits))
+    (ok {reduction: reduction-pct, credits-earned: bonus-credits, co2-saved: co2-saved})))
