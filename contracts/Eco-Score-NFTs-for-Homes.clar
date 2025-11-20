@@ -21,6 +21,9 @@
 (define-constant err-invalid-carbon-data (err u115))
 (define-constant err-carbon-tracking-disabled (err u116))
 (define-constant err-report-too-soon (err u117))
+(define-constant err-already-on-leaderboard (err u118))
+(define-constant err-not-on-leaderboard (err u119))
+(define-constant err-leaderboard-full (err u120))
 
 (define-constant achievement-eco-warrior u100)
 (define-constant achievement-green-champion u150)
@@ -33,9 +36,11 @@
 (define-constant maintenance-cooldown-blocks u1095)
 (define-constant carbon-report-cooldown u2190) ;; ~30 days between reports
 (define-constant carbon-reduction-threshold u10) ;; 10% reduction for bonus
+(define-constant max-leaderboard-size u50)
 
 (define-data-var last-token-id uint u0)
 (define-data-var total-eco-credits uint u0)
+(define-data-var leaderboard-count uint u0)
 
 (map-set maintenance-types "solar-cleaning" {score-boost: u5, credit-reward: u10})
 (map-set maintenance-types "insulation-check" {score-boost: u3, credit-reward: u8})
@@ -108,6 +113,17 @@
     achieved-at: uint
   })
 
+(define-map leaderboard-entries uint
+  {
+    token-id: uint,
+    score: uint,
+    owner: principal,
+    rank: uint,
+    last-updated: uint
+  })
+
+(define-map token-leaderboard-position uint uint)
+
 (define-read-only (get-last-token-id)
   (var-get last-token-id))
 
@@ -153,6 +169,24 @@
 
 (define-read-only (get-carbon-reduction-achievement (token-id uint) (period uint))
   (map-get? carbon-reduction-achievements {token-id: token-id, period: period}))
+
+(define-read-only (get-leaderboard-entry (position uint))
+  (map-get? leaderboard-entries position))
+
+(define-read-only (get-token-rank (token-id uint))
+  (let
+    (
+      (position (map-get? token-leaderboard-position token-id))
+    )
+    (if (is-some position)
+      (ok (unwrap-panic position))
+      err-not-on-leaderboard)))
+
+(define-read-only (get-leaderboard-size)
+  (var-get leaderboard-count))
+
+(define-read-only (get-top-homes (count uint))
+  (ok (map get-leaderboard-entry (list u1 u2 u3 u4 u5 u6 u7 u8 u9 u10))))
 
 (define-read-only (calculate-co2-emissions (kwh-usage uint) (gas-usage uint) (water-usage uint) (waste-kg uint))
   (let
@@ -567,3 +601,79 @@
       })
     (try! (award-eco-credits owner bonus-credits))
     (ok {reduction: reduction-pct, credits-earned: bonus-credits, co2-saved: co2-saved})))
+
+(define-public (join-leaderboard (token-id uint))
+  (let
+    (
+      (owner (unwrap! (nft-get-owner? eco-home token-id) err-token-not-found))
+      (score-data (unwrap! (get-eco-score token-id) err-token-not-found))
+      (current-score (get total-score score-data))
+      (existing-position (map-get? token-leaderboard-position token-id))
+      (current-count (var-get leaderboard-count))
+    )
+    (asserts! (is-eq tx-sender owner) err-not-token-owner)
+    (asserts! (is-none existing-position) err-already-on-leaderboard)
+    (asserts! (< current-count max-leaderboard-size) err-leaderboard-full)
+    
+    (let
+      (
+        (new-position (+ current-count u1))
+      )
+      (map-set leaderboard-entries new-position
+        {
+          token-id: token-id,
+          score: current-score,
+          owner: owner,
+          rank: new-position,
+          last-updated: stacks-block-height
+        })
+      (map-set token-leaderboard-position token-id new-position)
+      (var-set leaderboard-count new-position)
+      (ok new-position))))
+
+(define-public (update-leaderboard-score (token-id uint))
+  (let
+    (
+      (owner (unwrap! (nft-get-owner? eco-home token-id) err-token-not-found))
+      (score-data (unwrap! (get-eco-score token-id) err-token-not-found))
+      (current-score (get total-score score-data))
+      (position (unwrap! (map-get? token-leaderboard-position token-id) err-not-on-leaderboard))
+      (entry (unwrap! (get-leaderboard-entry position) err-not-on-leaderboard))
+    )
+    (asserts! (is-eq tx-sender owner) err-not-token-owner)
+    
+    (map-set leaderboard-entries position
+      (merge entry
+        {
+          score: current-score,
+          last-updated: stacks-block-height
+        }))
+    (ok current-score)))
+
+(define-public (leave-leaderboard (token-id uint))
+  (let
+    (
+      (owner (unwrap! (nft-get-owner? eco-home token-id) err-token-not-found))
+      (position (unwrap! (map-get? token-leaderboard-position token-id) err-not-on-leaderboard))
+      (current-count (var-get leaderboard-count))
+      (last-position current-count)
+    )
+    (asserts! (is-eq tx-sender owner) err-not-token-owner)
+    
+    (if (is-eq position last-position)
+      (begin
+        (map-delete leaderboard-entries position)
+        (map-delete token-leaderboard-position token-id)
+        (var-set leaderboard-count (- current-count u1))
+        (ok true))
+      (let
+        (
+          (last-entry (unwrap! (get-leaderboard-entry last-position) err-not-on-leaderboard))
+          (swapped-token-id (get token-id last-entry))
+        )
+        (map-set leaderboard-entries position last-entry)
+        (map-set token-leaderboard-position swapped-token-id position)
+        (map-delete leaderboard-entries last-position)
+        (map-delete token-leaderboard-position token-id)
+        (var-set leaderboard-count (- current-count u1))
+        (ok true)))))
